@@ -246,38 +246,65 @@ Del_forwarding(){
   need_root
   check_iptables
 
-  echo -e "${Info} 请输入要删除的规则参数（必须与添加时一致）"
-  read -r -e -p "本地端口(支持段 2333-6666): " local_port
-  validate_port "${local_port}" || { echo -e "${Error} 端口格式错误"; exit 1; }
-  read -r -e -p "远程IP: " forwarding_ip
-  [[ -z "${forwarding_ip}" ]] && exit 1
-  read -r -e -p "远程端口(支持段 2333-6666): " forwarding_port
-  validate_port "${forwarding_port}" || { echo -e "${Error} 端口格式错误"; exit 1; }
+  # 取出DNAT规则列表（只取 PREROUTING 中的 DNAT）
+  mapfile -t rules < <(iptables -t nat -S PREROUTING | grep -E -- '-j DNAT')
 
-  echo -e "选择协议:
- 1. TCP
- 2. UDP
- 3. TCP+UDP"
-  read -r -e -p "(默认: 3): " n
-  [[ -z "$n" ]] && n=3
+  if [[ ${#rules[@]} -eq 0 ]]; then
+    echo -e "${Error} 没有发现 DNAT 转发规则！"
+    return
+  fi
 
-  del_one(){
-    local proto="$1"
-    iptables_del_if_exists nat PREROUTING -p "$proto" --dport "${local_port}" \
-      -j DNAT --to-destination "${forwarding_ip}:$(to_dest_port "${forwarding_port}")"
-    iptables_del_if_exists nat POSTROUTING -p "$proto" -d "${forwarding_ip}" --dport "${forwarding_port}" \
-      -j SNAT --to-source "$(detect_local_ip)"
-    iptables_del_if_exists filter FORWARD -p "$proto" -d "${forwarding_ip}" --dport "${forwarding_port}" -j ACCEPT
-  }
+  echo -e "\n${Info} 当前 DNAT 转发规则列表："
+  echo "————————————————————————————————————"
 
-  case "$n" in
-    1) del_one tcp ;;
-    2) del_one udp ;;
-    *) del_one tcp; del_one udp ;;
-  esac
+  # 输出编号列表
+  for i in "${!rules[@]}"; do
+    idx=$((i+1))
+    proto=$(echo "${rules[$i]}" | awk '{for(j=1;j<=NF;j++) if($j=="-p") print $(j+1)}')
+    lport=$(echo "${rules[$i]}" | awk -F'--dport ' '{print $2}' | awk '{print $1}')
+    dest=$(echo "${rules[$i]}" | awk -F'--to-destination ' '{print $2}')
+    echo -e "${Green}${idx}.${NC} 协议:${Red}${proto}${NC} 本地端口:${Red}${lport}${NC} -> 目标:${Red}${dest}${NC}"
+  done
+
+  echo "————————————————————————————————————"
+  read -r -e -p "请输入要删除的规则编号(回车取消): " num
+
+  [[ -z "${num}" ]] && echo "取消..." && return
+
+  # 检查输入合法
+  if ! [[ "${num}" =~ ^[0-9]+$ ]]; then
+    echo -e "${Error} 输入必须是数字！"
+    return
+  fi
+
+  if (( num < 1 || num > ${#rules[@]} )); then
+    echo -e "${Error} 编号超出范围！"
+    return
+  fi
+
+  target_rule="${rules[$((num-1))]}"
+
+  # 从规则里解析参数
+  proto=$(echo "${target_rule}" | awk '{for(j=1;j<=NF;j++) if($j=="-p") print $(j+1)}')
+  lport=$(echo "${target_rule}" | awk -F'--dport ' '{print $2}' | awk '{print $1}')
+  dest=$(echo "${target_rule}" | awk -F'--to-destination ' '{print $2}')
+
+  forwarding_ip="${dest%%:*}"
+  forwarding_port="${dest#*:}"
+
+  echo -e "${Tip} 正在删除：${proto} ${lport} -> ${forwarding_ip}:${forwarding_port}"
+
+  # 删除 DNAT（PREROUTING）
+  iptables -t nat -D PREROUTING -p "${proto}" --dport "${lport}" -j DNAT --to-destination "${forwarding_ip}:${forwarding_port}"
+
+  # 删除 SNAT（POSTROUTING）如果存在
+  iptables -t nat -D POSTROUTING -p "${proto}" -d "${forwarding_ip}" --dport "${forwarding_port}" -j SNAT --to-source "$(detect_local_ip)" 2>/dev/null || true
+
+  # 删除 FORWARD 放行（如果存在）
+  iptables -D FORWARD -p "${proto}" -d "${forwarding_ip}" --dport "${forwarding_port}" -j ACCEPT 2>/dev/null || true
 
   Save_iptables
-  echo -e "${Info} 删除并保存完成！"
+  echo -e "${Info} 删除完成并已保存！"
 }
 
 Uninstall_forwarding(){
