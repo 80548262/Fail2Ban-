@@ -1,6 +1,6 @@
 #!/bin/bash
 
-URL="http://speedtest.tele2.net/1GB.zip"
+URL="https://r2.wuxie.de/hello100.png"
 
 echo "开始测速（精确限制100MB流量）..."
 
