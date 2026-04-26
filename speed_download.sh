@@ -1,6 +1,6 @@
 #!/bin/bash
 
-URL="https://r2.wuxie.de/hello100.png"
+URL="https://releases.ubuntu.com/22.04/ubuntu-22.04.5-desktop-amd64.iso"
 
 echo "开始测速（精确限制100MB流量）..."
 
