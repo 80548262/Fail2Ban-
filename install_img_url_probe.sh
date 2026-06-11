@@ -3,25 +3,13 @@ set -eu
 
 APP_DIR="/www"
 APP_FILE="img_url_probe.py"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="python3"
 
-# Replace this with your GitHub raw direct URL before uploading the script.
-# Example: https://raw.githubusercontent.com/user/repo/main/img_url_probe.py
-DEFAULT_DOWNLOAD_URL="https://raw.githubusercontent.com/80548262/Fail2Ban-/refs/heads/main/img_url_probe.py"
-DOWNLOAD_URL="${IMG_URL_PROBE_URL:-$DEFAULT_DOWNLOAD_URL}"
-
-usage() {
-  printf '%s\n' "Usage: sh install_img_url_probe.sh"
-  printf '%s\n' "   or: IMG_URL_PROBE_URL=<url> sh install_img_url_probe.sh"
-  printf '%s\n' "   or: sh install_img_url_probe.sh <img_url_probe.py_download_url>"
-  printf '%s\n' ""
-  printf '%s\n' "Example:"
-  printf '%s\n' "  sh install_img_url_probe.sh https://raw.githubusercontent.com/user/repo/main/img_url_probe.py"
-}
+DOWNLOAD_URL="https://raw.githubusercontent.com/80548262/Fail2Ban-/refs/heads/main/img_url_probe.py"
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    printf '%s\n' "This script must be run as root. Try: sudo sh install_img_url_probe.sh <url>" >&2
+    printf '%s\n' "This script must be run as root. Try: sudo sh install_img_url_probe.sh" >&2
     exit 1
   fi
 }
@@ -69,52 +57,24 @@ install_python() {
 }
 
 download_file() {
-  url="$1"
-  target="$2"
-
   if command -v curl >/dev/null 2>&1; then
-    curl -fL "$url" -o "$target"
+    curl -fL "$DOWNLOAD_URL" -o "$APP_DIR/$APP_FILE"
   elif command -v wget >/dev/null 2>&1; then
-    wget -O "$target" "$url"
+    wget -O "$APP_DIR/$APP_FILE" "$DOWNLOAD_URL"
   else
     printf '%s\n' "curl/wget not found after dependency installation." >&2
     exit 1
   fi
 }
 
-validate_download_url() {
-  if [ "$DOWNLOAD_URL" = "$DEFAULT_DOWNLOAD_URL" ]; then
-    printf '%s\n' "Error: please replace DEFAULT_DOWNLOAD_URL with your GitHub raw URL." >&2
-    exit 1
-  fi
-
-  if [ "$DOWNLOAD_URL" = "" ]; then
-    usage >&2
-    printf '%s\n' "Error: missing img_url_probe.py download URL." >&2
-    exit 1
-  fi
-}
-
 main() {
-  if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    usage
-    exit 0
-  fi
-
-  if [ "${1:-}" != "" ]; then
-    DOWNLOAD_URL="$1"
-  fi
-
-  validate_download_url
-
   need_root
   mkdir -p "$APP_DIR"
   install_python
-  download_file "$DOWNLOAD_URL" "$APP_DIR/$APP_FILE"
+  download_file
   chmod 0644 "$APP_DIR/$APP_FILE"
 
   printf '%s\n' "Installed: $APP_DIR/$APP_FILE"
-  "$PYTHON_BIN" "$APP_DIR/$APP_FILE" --help >/dev/null 2>&1 || true
 }
 
-main "$@"
+main
