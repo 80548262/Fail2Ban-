@@ -24,6 +24,8 @@ URL_PATTERN = re.compile(
     r"(?P<digits>\d{18})(?P<ext>\.[A-Za-z0-9]+)$"
 )
 ARTICLE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# 「图片链接」「图片链接1」「图片链接2」… 这类列名的匹配，用于多图列采集。
+IMAGE_COLUMN_PATTERN = re.compile(r"^(?:图片链接|图片url|image_url|image url|image)\s*\d*$")
 
 DATE_DIGITS = 8
 HOUR_DIGITS = 2
@@ -120,9 +122,9 @@ class ProbeSummary:
 class BatchItem:
     row_number: int
     article_url: str
-    image_url: str
+    image_urls: tuple[str, ...]
     article_id: str
-    next_image_url: str = ""
+    next_image_urls: tuple[str, ...] = ()
     img_count: Optional[int] = None
 
 
@@ -566,6 +568,82 @@ def find_column_index(headers: list[str], candidates: tuple[str, ...]) -> Option
     return None
 
 
+def find_image_column_indices(headers: list[str]) -> list[int]:
+    """找出所有「图片链接N」列的下标，按列名中的序号升序排列。
+
+    兼容旧表格的单列「图片链接」（无序号视为 0）。
+    """
+    matched: list[tuple[int, int]] = []
+    for index, header in enumerate(headers):
+        name = header.strip().lower()
+        if not IMAGE_COLUMN_PATTERN.match(name):
+            continue
+        digits = re.search(r"\d+", name)
+        order = int(digits.group()) if digits else 0
+        matched.append((order, index))
+    matched.sort()
+    return [index for _, index in matched]
+
+
+def image_url_timestamp(image_url: str) -> Optional[int]:
+    """从图片 URL 文件名中提取 18 位时间戳并转成可比较的整数；无法解析返回 None。"""
+    match = URL_PATTERN.match(urlsplit(image_url.strip()).path)
+    if not match:
+        return None
+    return int(match.group("digits"))
+
+
+def select_latest_image_url(image_urls: list[str]) -> Optional[str]:
+    """从一组图片链接中选时间戳（yyyyMMddHHmmssSSS）最新的一条。
+
+    无法解析时间戳的链接被忽略；若全部无法解析，则回退到第一条非空链接。
+    """
+    best_url: Optional[str] = None
+    best_ts: Optional[int] = None
+    for image_url in image_urls:
+        cleaned = image_url.strip()
+        if not cleaned:
+            continue
+        ts = image_url_timestamp(cleaned)
+        if ts is None:
+            continue
+        if best_ts is None or ts > best_ts:
+            best_ts = ts
+            best_url = cleaned
+
+    if best_url is not None:
+        return best_url
+
+    for image_url in image_urls:
+        if image_url.strip():
+            return image_url.strip()
+    return None
+
+
+def select_earliest_image_url(image_urls: list[str]) -> Optional[str]:
+    """从一组图片链接中选时间戳最早的一条，用于作为下一行的停止上界。"""
+    best_url: Optional[str] = None
+    best_ts: Optional[int] = None
+    for image_url in image_urls:
+        cleaned = image_url.strip()
+        if not cleaned:
+            continue
+        ts = image_url_timestamp(cleaned)
+        if ts is None:
+            continue
+        if best_ts is None or ts < best_ts:
+            best_ts = ts
+            best_url = cleaned
+
+    if best_url is not None:
+        return best_url
+
+    for image_url in image_urls:
+        if image_url.strip():
+            return image_url.strip()
+    return None
+
+
 def row_is_completed(row: list[str]) -> bool:
     return any(COMPLETED_MARK in cell.strip() for cell in row)
 
@@ -606,7 +684,6 @@ def mark_batch_row_completed(table_path: str, row_number: int) -> None:
 
 def read_batch_items(table_path: str) -> BatchReadResult:
     article_columns = ("文章URL", "文章链接", "article_url", "article url", "url")
-    image_columns = ("图片链接", "图片URL", "image_url", "image url", "image")
     img_count_columns = ("img数量", "图片数量", "img_count", "img count", "imgcount")
 
     rows = read_csv_rows(table_path)
@@ -616,13 +693,13 @@ def read_batch_items(table_path: str) -> BatchReadResult:
 
     headers = rows[0]
     article_index = find_column_index(headers, article_columns)
-    image_index = find_column_index(headers, image_columns)
-    has_header = article_index is not None and image_index is not None
+    image_indices = find_image_column_indices(headers)
+    has_header = article_index is not None and bool(image_indices)
     img_count_index = find_column_index(headers, img_count_columns) if has_header else None
 
     if not has_header:
         article_index = 0
-        image_index = 1
+        image_indices = [1]
 
     items: list[BatchItem] = []
     data_rows = rows[1:] if has_header else rows
@@ -643,19 +720,28 @@ def read_batch_items(table_path: str) -> BatchReadResult:
         if row_is_completed(row):
             skipped_completed += 1
             continue
-        if len(row) <= max(article_index, image_index):
-            raise ValueError(f"第 {row_number} 行缺少文章 URL 或图片链接")
+        if len(row) <= article_index:
+            raise ValueError(f"第 {row_number} 行缺少文章 URL")
 
         article_url = row[article_index].strip()
-        image_url = row[image_index].strip()
-        if not article_url or not image_url:
-            raise ValueError(f"第 {row_number} 行文章 URL 或图片链接为空")
+        image_urls = tuple(
+            row[idx].strip()
+            for idx in image_indices
+            if idx < len(row) and row[idx].strip()
+        )
+        if not article_url:
+            raise ValueError(f"第 {row_number} 行文章 URL 为空")
+        if not image_urls:
+            raise ValueError(f"第 {row_number} 行没有任何图片链接")
 
-        next_image_url = ""
+        next_image_urls: tuple[str, ...] = ()
         if position + 1 < len(collected):
             next_row = collected[position + 1][1]
-            if len(next_row) > image_index:
-                next_image_url = next_row[image_index].strip()
+            next_image_urls = tuple(
+                next_row[idx].strip()
+                for idx in image_indices
+                if idx < len(next_row) and next_row[idx].strip()
+            )
 
         img_count: Optional[int] = None
         if img_count_index is not None and len(row) > img_count_index:
@@ -674,9 +760,9 @@ def read_batch_items(table_path: str) -> BatchReadResult:
             BatchItem(
                 row_number=row_number,
                 article_url=article_url,
-                image_url=image_url,
+                image_urls=image_urls,
                 article_id=extract_article_id(article_url),
-                next_image_url=next_image_url,
+                next_image_urls=next_image_urls,
                 img_count=img_count,
             )
         )
@@ -688,17 +774,17 @@ def read_batch_items(table_path: str) -> BatchReadResult:
     )
 
 
-def resolve_batch_seed_url(item: BatchItem) -> str:
-    image_url = item.image_url.strip()
+def resolve_image_url(image_url: str, article_url: str, row_number: int) -> str:
+    image_url = image_url.strip()
     parsed_image = urlsplit(image_url)
     if parsed_image.scheme and parsed_image.netloc:
         return image_url
 
-    parsed_article = urlsplit(item.article_url)
+    parsed_article = urlsplit(article_url)
     if parsed_article.scheme and parsed_article.netloc:
-        return urljoin(item.article_url, image_url)
+        return urljoin(article_url, image_url)
 
-    raise ValueError(f"第 {item.row_number} 行图片链接不是完整 URL，且文章 URL 也无法提供域名")
+    raise ValueError(f"第 {row_number} 行图片链接不是完整 URL，且文章 URL 也无法提供域名")
 
 
 def resolve_stop_position(seed: SeedInfo, next_image_url: str) -> Optional[int]:
@@ -735,6 +821,7 @@ def run_probe(
         article_url: str = "",
         stop_position: Optional[int] = None,
         img_count: Optional[int] = None,
+        prerecord_urls: Optional[list[str]] = None,
 ) -> ProbeSummary:
     validate_probe_args(args)
     seed = parse_seed_url(args.url)
@@ -829,24 +916,56 @@ def run_probe(
         yield from iter_position_range(seed, base_end, ext_end)
 
     try:
-        seed_url = build_url(seed, seed.minute, seed.second, seed.fraction)
-        seed_result = detect_url(
-            seed_url,
-            seed.minute,
-            seed.second,
-            seed.fraction,
-            args,
-            printer,
-        )
-        checked += 1
-        with hits_lock:
-            store_detection_result(
-                seed_result,
-                hits,
-                retry_failures,
-                args.output,
-                retry_output_path,
+        # 先检测并记录表格提供的其余图片链接（种子之外的几条），它们也计入 found。
+        for prerecord_url in prerecord_urls or ():
+            cleaned = prerecord_url.strip()
+            if not cleaned:
+                continue
+            try:
+                pre_seed = parse_seed_url(cleaned)
+            except ValueError:
+                printer.line(f"[跳过预记录] 无法解析链接格式：{cleaned}")
+                continue
+            pre_result = detect_url(
+                cleaned,
+                pre_seed.minute,
+                pre_seed.second,
+                pre_seed.fraction,
+                args,
+                printer,
             )
+            checked += 1
+            with hits_lock:
+                store_detection_result(
+                    pre_result,
+                    hits,
+                    retry_failures,
+                    args.output,
+                    retry_output_path,
+                )
+
+        seed_url = build_url(seed, seed.minute, seed.second, seed.fraction)
+        # 预记录已达标则直接跳过种子检测与后续枚举。
+        if reached_img_limit():
+            printer.line(f"[达标] found={found_count()} 已达到 img 数量 {img_count}，停止该行。")
+        else:
+            seed_result = detect_url(
+                seed_url,
+                seed.minute,
+                seed.second,
+                seed.fraction,
+                args,
+                printer,
+            )
+            checked += 1
+            with hits_lock:
+                store_detection_result(
+                    seed_result,
+                    hits,
+                    retry_failures,
+                    args.output,
+                    retry_output_path,
+                )
 
         if reached_img_limit():
             printer.line(f"[达标] found={found_count()} 已达到 img 数量 {img_count}，停止该行。")
@@ -980,20 +1099,33 @@ def run_batch(args: argparse.Namespace, table_path: str) -> int:
             f"id={item.article_id}, 输出={output_path}"
         )
         try:
-            seed_url = resolve_batch_seed_url(item)
+            # 把本行所有图片链接解析成完整 URL。
+            resolved_urls = [
+                resolve_image_url(raw, item.article_url, item.row_number)
+                for raw in item.image_urls
+            ]
+            # 从这些链接中选时间戳最新的作为种子，继续向后枚举。
+            seed_url = select_latest_image_url(resolved_urls)
+            if not seed_url:
+                raise ValueError(f"第 {item.row_number} 行没有可用的图片链接")
+            printer.line(
+                f"[选种] 本行 {len(resolved_urls)} 条链接，最新种子: {seed_url}"
+            )
+            # 其余链接（种子之外）先单独检测并记录，同样计入 found。
+            prerecord_urls = [url for url in resolved_urls if url != seed_url]
+
             stop_position = None
-            if item.next_image_url:
+            if item.next_image_urls:
                 try:
                     seed_for_stop = parse_seed_url(seed_url)
-                    next_seed_url = resolve_batch_seed_url(
-                        BatchItem(
-                            row_number=item.row_number,
-                            article_url=item.article_url,
-                            image_url=item.next_image_url,
-                            article_id=item.article_id,
-                        )
-                    )
-                    stop_position = resolve_stop_position(seed_for_stop, next_seed_url)
+                    next_resolved = [
+                        resolve_image_url(raw, item.article_url, item.row_number)
+                        for raw in item.next_image_urls
+                    ]
+                    # 下一行的上界用其最早的链接，避免越过下一篇文章的起点。
+                    next_seed_url = select_earliest_image_url(next_resolved)
+                    if next_seed_url:
+                        stop_position = resolve_stop_position(seed_for_stop, next_seed_url)
                 except ValueError:
                     stop_position = None
             probe_args = argparse.Namespace(**vars(args))
@@ -1006,6 +1138,7 @@ def run_batch(args: argparse.Namespace, table_path: str) -> int:
                 article_url=item.article_url,
                 stop_position=stop_position,
                 img_count=item.img_count,
+                prerecord_urls=prerecord_urls,
             )
             if summary.interrupted:
                 printer.line("[批量中断] 当前任务已保存，停止后续批量任务。")
@@ -1046,7 +1179,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MINUTE_INCREMENT_COUNT,
         help=f"分钟最多进位次数，默认 {DEFAULT_MINUTE_INCREMENT_COUNT}；0 表示只检测当前分钟",
     )
-    parser.add_argument("--workers", type=int, default=50, help="并发数，默认 50")
+    parser.add_argument("--workers", type=int, default=200, help="并发数，默认 50")
     parser.add_argument("--delay", type=float, default=0.05, help="每个请求前延迟秒数，默认 0.05")
     parser.add_argument("--timeout", type=float, default=5.0, help="请求超时时间，默认 5 秒")
     parser.add_argument("--retries", type=int, default=REQUEST_RETRIES, help=f"超时/临时错误重试次数，默认 {REQUEST_RETRIES}")
