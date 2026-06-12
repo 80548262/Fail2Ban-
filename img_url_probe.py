@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#img数量 +2 就行了，+3很少，并发最多200 他这个网站最多400，超时设置5，基础时间1就行了，附加0.6
 
 import argparse
 import csv
@@ -34,14 +35,20 @@ MAX_HOUR = 23
 MAX_MINUTE = 59
 MAX_SECOND = 59
 MAX_FRACTION = 10**FRACTION_DIGITS - 1
+# 单分钟内的候选数量，用于精确计算候选总数。
+CANDIDATES_PER_SECOND = MAX_FRACTION + 1
+CANDIDATES_PER_MINUTE = (MAX_SECOND + 1) * CANDIDATES_PER_SECOND
 # 分钟最多进位次数；0 表示只检测当前分钟剩余候选。
 DEFAULT_MINUTE_INCREMENT_COUNT = 1
+# 候选分钟数循环完后、仍未达到 img 数量时，每轮额外延伸的分钟数（0.3 分钟 = 18 秒）。
+EXTENSION_MINUTE_FRACTION = 0.6
+EXTENSION_POSITION_STEP = round(EXTENSION_MINUTE_FRACTION * CANDIDATES_PER_MINUTE)
 # 单个 URL 的临时错误重试次数。
 REQUEST_RETRIES = 3
 # 重试退避基准秒数；第 n 次重试前等待 retry_backoff * n。
 RETRY_BACKOFF_SECONDS = 0.5
-DEFAULT_BATCH_TABLE = r"/www/60.csv"
-DEFAULT_BATCH_OUTPUT_DIR = r"/www/probe_json"
+DEFAULT_BATCH_TABLE = r"D:\imgclaw\pythonProject\data\tk-61-1.csv"
+DEFAULT_BATCH_OUTPUT_DIR = r"D:\imgclaw\pythonProject\data\probe_json"
 COMPLETED_MARK = "已完成"
 
 
@@ -115,6 +122,8 @@ class BatchItem:
     article_url: str
     image_url: str
     article_id: str
+    next_image_url: str = ""
+    img_count: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -192,10 +201,46 @@ def build_url(seed: SeedInfo, minute: int, second: int, fraction: int) -> str:
     )
 
 
+def timestamp_position(minute: int, second: int, fraction: int) -> int:
+    """把 分/秒/四位小数 折算成单调递增的整数位置，便于区间比较。"""
+    return (minute * (MAX_SECOND + 1) + second) * CANDIDATES_PER_SECOND + fraction
+
+
+def position_to_components(position: int) -> tuple[int, int, int]:
+    """timestamp_position 的逆运算，把整数位置还原成 分/秒/小数。"""
+    minute = position // CANDIDATES_PER_MINUTE
+    rem = position % CANDIDATES_PER_MINUTE
+    second = rem // CANDIDATES_PER_SECOND
+    fraction = rem % CANDIDATES_PER_SECOND
+    return minute, second, fraction
+
+
+def iter_position_range(
+        seed: SeedInfo,
+        start_position: int,
+        end_position: int,
+) -> Iterable[tuple[str, int, int, int]]:
+    """按 [start_position, end_position) 区间顺序产出候选 URL。
+
+    位置全部限制在同一 YYYYMMDDHH 之内（分钟封顶 MAX_MINUTE）。
+    """
+    hour_limit = timestamp_position(MAX_MINUTE, MAX_SECOND, MAX_FRACTION) + 1
+    end_position = min(end_position, hour_limit)
+    for position in range(start_position, end_position):
+        minute, second, fraction = position_to_components(position)
+        yield (
+            build_url(seed, minute, second, fraction),
+            minute,
+            second,
+            fraction,
+        )
+
+
 def iter_candidates(
         seed: SeedInfo,
         minute_increment_count: int,
         include_seed: bool = True,
+        stop_position: Optional[int] = None,
 ) -> Iterable[tuple[str, int, int, int]]:
     max_minute = min(MAX_MINUTE, seed.minute + minute_increment_count)
     for minute in range(seed.minute, max_minute + 1):
@@ -210,6 +255,12 @@ def iter_candidates(
                 continue
 
             for fraction in range(start_fraction, MAX_FRACTION + 1):
+                # 位置单调递增，一旦到达下一行文件名（不含）即可整体结束。
+                if (
+                        stop_position is not None
+                        and timestamp_position(minute, second, fraction) >= stop_position
+                ):
+                    return
                 yield (
                     build_url(seed, minute, second, fraction),
                     minute,
@@ -218,15 +269,17 @@ def iter_candidates(
                 )
 
 
-def count_candidates(seed: SeedInfo, minute_increment_count: int) -> int:
+def count_candidates(
+        seed: SeedInfo,
+        minute_increment_count: int,
+        stop_position: Optional[int] = None,
+) -> int:
     max_minute = min(MAX_MINUTE, seed.minute + minute_increment_count)
-    current_minute_total = (
-            (MAX_SECOND - seed.second) * (MAX_FRACTION + 1)
-            + (MAX_FRACTION - seed.fraction + 1)
-    )
-    extra_minute_count = max_minute - seed.minute
-    full_minute_total = (MAX_SECOND + 1) * (MAX_FRACTION + 1)
-    return current_minute_total + extra_minute_count * full_minute_total
+    start_pos = timestamp_position(seed.minute, seed.second, seed.fraction)
+    end_pos = timestamp_position(max_minute, MAX_SECOND, MAX_FRACTION) + 1
+    if stop_position is not None:
+        end_pos = min(end_pos, stop_position)
+    return max(0, end_pos - start_pos)
 
 
 def request_status(
@@ -554,6 +607,7 @@ def mark_batch_row_completed(table_path: str, row_number: int) -> None:
 def read_batch_items(table_path: str) -> BatchReadResult:
     article_columns = ("文章URL", "文章链接", "article_url", "article url", "url")
     image_columns = ("图片链接", "图片URL", "image_url", "image url", "image")
+    img_count_columns = ("img数量", "图片数量", "img_count", "img count", "imgcount")
 
     rows = read_csv_rows(table_path)
 
@@ -564,6 +618,7 @@ def read_batch_items(table_path: str) -> BatchReadResult:
     article_index = find_column_index(headers, article_columns)
     image_index = find_column_index(headers, image_columns)
     has_header = article_index is not None and image_index is not None
+    img_count_index = find_column_index(headers, img_count_columns) if has_header else None
 
     if not has_header:
         article_index = 0
@@ -575,10 +630,15 @@ def read_batch_items(table_path: str) -> BatchReadResult:
     skipped_completed = 0
     data_row_count = 0
 
+    # 先收集所有非空数据行（含已完成行），用于确定每行的“下一行文件名”上界。
+    collected: list[tuple[int, list[str]]] = []
     for offset, row in enumerate(data_rows):
         row_number = row_offset + offset
         if not row or all(not cell.strip() for cell in row):
             continue
+        collected.append((row_number, row))
+
+    for position, (row_number, row) in enumerate(collected):
         data_row_count += 1
         if row_is_completed(row):
             skipped_completed += 1
@@ -591,12 +651,33 @@ def read_batch_items(table_path: str) -> BatchReadResult:
         if not article_url or not image_url:
             raise ValueError(f"第 {row_number} 行文章 URL 或图片链接为空")
 
+        next_image_url = ""
+        if position + 1 < len(collected):
+            next_row = collected[position + 1][1]
+            if len(next_row) > image_index:
+                next_image_url = next_row[image_index].strip()
+
+        img_count: Optional[int] = None
+        if img_count_index is not None and len(row) > img_count_index:
+            raw_count = row[img_count_index].strip()
+            if raw_count:
+                try:
+                    parsed_count = int(raw_count)
+                except ValueError:
+                    raise ValueError(
+                        f"第 {row_number} 行 img 数量不是整数：{raw_count}"
+                    )
+                if parsed_count > 0:
+                    img_count = parsed_count
+
         items.append(
             BatchItem(
                 row_number=row_number,
                 article_url=article_url,
                 image_url=image_url,
                 article_id=extract_article_id(article_url),
+                next_image_url=next_image_url,
+                img_count=img_count,
             )
         )
 
@@ -620,6 +701,30 @@ def resolve_batch_seed_url(item: BatchItem) -> str:
     raise ValueError(f"第 {item.row_number} 行图片链接不是完整 URL，且文章 URL 也无法提供域名")
 
 
+def resolve_stop_position(seed: SeedInfo, next_image_url: str) -> Optional[int]:
+    """根据下一行图片链接计算停止位置（左闭右开区间的右界）。
+
+    仅当下一行图片与当前种子处于同一 YYYYMMDDHH 时，分/秒/小数的位置比较才有意义；
+    否则返回 None，表示该上界不适用，交由分钟进位规则封顶。
+    """
+    next_image_url = next_image_url.strip()
+    if not next_image_url:
+        return None
+    try:
+        next_seed = parse_seed_url(next_image_url)
+    except ValueError:
+        return None
+    if next_seed.date_hour_prefix != seed.date_hour_prefix:
+        return None
+    stop_position = timestamp_position(
+        next_seed.minute, next_seed.second, next_seed.fraction
+    )
+    seed_position = timestamp_position(seed.minute, seed.second, seed.fraction)
+    if stop_position <= seed_position:
+        return None
+    return stop_position
+
+
 def batch_output_path(output_dir: str, article_id: str) -> str:
     return os.path.join(output_dir, f"{article_id}.json")
 
@@ -628,13 +733,23 @@ def run_probe(
         args: argparse.Namespace,
         printer: SafePrinter,
         article_url: str = "",
+        stop_position: Optional[int] = None,
+        img_count: Optional[int] = None,
 ) -> ProbeSummary:
     validate_probe_args(args)
     seed = parse_seed_url(args.url)
     minute_increment_count = min(args.minute_increments, MAX_MINUTE - seed.minute)
     max_minute = seed.minute + minute_increment_count
-    total = count_candidates(seed, minute_increment_count)
+    total = count_candidates(seed, minute_increment_count, stop_position)
     retry_output_path = args.retry_output or default_retry_output_path(args.output)
+
+    # 计算候选位置区间：基础区间 [start_pos, base_end)，
+    # 延伸上界 abs_end（受下一行文件名 stop_position 约束，否则封顶到本小时末尾）。
+    start_pos = timestamp_position(seed.minute, seed.second, seed.fraction) + 1
+    hour_limit = timestamp_position(MAX_MINUTE, MAX_SECOND, MAX_FRACTION) + 1
+    base_end = timestamp_position(max_minute, MAX_SECOND, MAX_FRACTION) + 1
+    abs_end = hour_limit if stop_position is None else min(stop_position, hour_limit)
+    base_end = min(base_end, abs_end)
 
     hits: list[Hit] = []
     retry_failures: list[RetryFailure] = []
@@ -653,7 +768,29 @@ def run_probe(
         printer.line(f"[配置] 分钟范围: 仅当前分钟 {seed.minute:02d}")
     printer.line("[配置] 秒范围: 当前秒起步，进位后 00 -> 59")
     printer.line(f"[配置] 小数范围: 当前小数起步，进位后 0000 -> {MAX_FRACTION:0{FRACTION_DIGITS}d}")
+    if stop_position is not None:
+        stop_total = stop_position
+        stop_minute = stop_total // CANDIDATES_PER_MINUTE
+        rem = stop_total % CANDIDATES_PER_MINUTE
+        stop_second = rem // CANDIDATES_PER_SECOND
+        stop_fraction = rem % CANDIDATES_PER_SECOND
+        printer.line(
+            f"[配置] 下一行上界(不含): 分={stop_minute:02d}, 秒={stop_second:02d}, "
+            f"小数={stop_fraction:0{FRACTION_DIGITS}d}"
+        )
     printer.line(f"[配置] 候选数量上限: {total}")
+    if img_count is not None:
+        printer.line(
+            f"[配置] img 数量目标: {img_count}（found 达到即停止该行）"
+        )
+        if stop_position is None:
+            printer.line(
+                f"[配置] 候选耗尽且未达标时，最多再延伸 {EXTENSION_MINUTE_FRACTION} 分钟（单轮）后停止"
+            )
+        else:
+            printer.line(
+                f"[配置] 候选耗尽且未达标时，最多再延伸 {EXTENSION_MINUTE_FRACTION} 分钟（单轮，受下一行上界约束）后停止"
+            )
     printer.line(f"[配置] 输出文件: {os.path.abspath(args.output)}")
     printer.line(f"[配置] 临时失败文件: {os.path.abspath(retry_output_path)}")
 
@@ -661,6 +798,35 @@ def run_probe(
     interrupted = False
     started_at = time.monotonic()
     dump_retry_failures(retry_output_path, retry_failures)
+
+    def found_count() -> int:
+        with hits_lock:
+            return len(hits)
+
+    def reached_img_limit() -> bool:
+        return img_count is not None and found_count() >= img_count
+
+    def candidate_stream() -> Iterable[tuple[str, int, int, int]]:
+        """先产出基础区间候选；若设置了 img 数量且仍未达标，则最多延伸一轮 0.3 分钟。
+
+        - img 数量达标：立即停止（最高优先级）。
+        - 基础区间（minute_increments 决定）跑完仍未达标：最多再延伸 EXTENSION_MINUTE_FRACTION
+          分钟（单轮，不再继续），即总时长封顶在 minute_increments + EXTENSION_MINUTE_FRACTION。
+        - 延伸上界同时受下一行文件名 abs_end 与本小时末尾约束。
+        - 未设置 img 数量：只产出基础区间，行为与原逻辑一致。
+        """
+        yield from iter_position_range(seed, start_pos, base_end)
+        if img_count is None or base_end >= abs_end or reached_img_limit():
+            return
+        ext_end = min(base_end + EXTENSION_POSITION_STEP, abs_end)
+        ext_minute, ext_second, ext_fraction = position_to_components(ext_end)
+        printer.line(
+            f"[延伸] 候选已耗尽且 found={found_count()}<{img_count}，"
+            f"最多再延伸 {EXTENSION_MINUTE_FRACTION} 分钟至 "
+            f"分={ext_minute:02d} 秒={ext_second:02d} "
+            f"小数={ext_fraction:0{FRACTION_DIGITS}d}"
+        )
+        yield from iter_position_range(seed, base_end, ext_end)
 
     try:
         seed_url = build_url(seed, seed.minute, seed.second, seed.fraction)
@@ -682,63 +848,71 @@ def run_probe(
                 retry_output_path,
             )
 
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            candidates = iter_candidates(
-                seed,
-                minute_increment_count,
-                include_seed=False,
-            )
-            pending = set()
-            exhausted = False
-            max_pending = args.workers * 4
+        if reached_img_limit():
+            printer.line(f"[达标] found={found_count()} 已达到 img 数量 {img_count}，停止该行。")
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                candidates = candidate_stream()
+                pending = set()
+                exhausted = False
+                max_pending = args.workers * 4
 
-            while pending or not exhausted:
-                while not exhausted and len(pending) < max_pending:
-                    try:
-                        url, minute, second, fraction = next(candidates)
-                    except StopIteration:
-                        exhausted = True
+                while pending or not exhausted:
+                    while not exhausted and len(pending) < max_pending:
+                        if reached_img_limit():
+                            exhausted = True
+                            break
+                        try:
+                            url, minute, second, fraction = next(candidates)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        pending.add(
+                            executor.submit(
+                                detect_url,
+                                url,
+                                minute,
+                                second,
+                                fraction,
+                                args,
+                                printer,
+                            )
+                        )
+
+                    if not pending:
                         break
-                    pending.add(
-                        executor.submit(
-                            detect_url,
-                            url,
-                            minute,
-                            second,
-                            fraction,
-                            args,
-                            printer,
-                        )
-                    )
 
-                if not pending:
-                    break
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        checked += 1
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            printer.line(f"[ERR] worker failed -> {exc}")
+                            result = DetectionResult(hit=None, retry_failure=None)
 
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    checked += 1
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        printer.line(f"[ERR] worker failed -> {exc}")
-                        result = DetectionResult(hit=None, retry_failure=None)
+                        with hits_lock:
+                            store_detection_result(
+                                result,
+                                hits,
+                                retry_failures,
+                                args.output,
+                                retry_output_path,
+                            )
 
-                    with hits_lock:
-                        store_detection_result(
-                            result,
-                            hits,
-                            retry_failures,
-                            args.output,
-                            retry_output_path,
-                        )
+                        if checked % 1000 == 0:
+                            elapsed = max(time.monotonic() - started_at, 0.001)
+                            printer.line(
+                                f"[进度] checked={checked}/{total}, "
+                                f"found={len(hits)}, "
+                                f"retry_failed={len(retry_failures)}, "
+                                f"rate={checked / elapsed:.2f}/s"
+                            )
 
-                    if checked % 1000 == 0:
-                        elapsed = max(time.monotonic() - started_at, 0.001)
+                    if reached_img_limit() and not exhausted:
+                        exhausted = True
                         printer.line(
-                            f"[进度] checked={checked}/{total}, "
-                            f"found={len(hits)}, "
-                            f"retry_failed={len(retry_failures)}, "
-                            f"rate={checked / elapsed:.2f}/s"
+                            f"[达标] found={found_count()} 已达到 img 数量 {img_count}，停止该行。"
                         )
     except KeyboardInterrupt:
         interrupted = True
@@ -807,11 +981,32 @@ def run_batch(args: argparse.Namespace, table_path: str) -> int:
         )
         try:
             seed_url = resolve_batch_seed_url(item)
+            stop_position = None
+            if item.next_image_url:
+                try:
+                    seed_for_stop = parse_seed_url(seed_url)
+                    next_seed_url = resolve_batch_seed_url(
+                        BatchItem(
+                            row_number=item.row_number,
+                            article_url=item.article_url,
+                            image_url=item.next_image_url,
+                            article_id=item.article_id,
+                        )
+                    )
+                    stop_position = resolve_stop_position(seed_for_stop, next_seed_url)
+                except ValueError:
+                    stop_position = None
             probe_args = argparse.Namespace(**vars(args))
             probe_args.url = seed_url
             probe_args.output = output_path
             probe_args.retry_output = None
-            summary = run_probe(probe_args, printer, article_url=item.article_url)
+            summary = run_probe(
+                probe_args,
+                printer,
+                article_url=item.article_url,
+                stop_position=stop_position,
+                img_count=item.img_count,
+            )
             if summary.interrupted:
                 printer.line("[批量中断] 当前任务已保存，停止后续批量任务。")
                 return 130
@@ -851,7 +1046,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MINUTE_INCREMENT_COUNT,
         help=f"分钟最多进位次数，默认 {DEFAULT_MINUTE_INCREMENT_COUNT}；0 表示只检测当前分钟",
     )
-    parser.add_argument("--workers", type=int, default=100, help="并发数，默认 50")
+    parser.add_argument("--workers", type=int, default=50, help="并发数，默认 50")
     parser.add_argument("--delay", type=float, default=0.05, help="每个请求前延迟秒数，默认 0.05")
     parser.add_argument("--timeout", type=float, default=5.0, help="请求超时时间，默认 5 秒")
     parser.add_argument("--retries", type=int, default=REQUEST_RETRIES, help=f"超时/临时错误重试次数，默认 {REQUEST_RETRIES}")
