@@ -12,6 +12,8 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from html import unescape
+from html.parser import HTMLParser
 from threading import Lock
 from typing import Iterable, Optional
 from urllib.error import HTTPError, URLError
@@ -49,9 +51,91 @@ EXTENSION_POSITION_STEP = round(EXTENSION_MINUTE_FRACTION * CANDIDATES_PER_MINUT
 REQUEST_RETRIES = 3
 # 重试退避基准秒数；第 n 次重试前等待 retry_backoff * n。
 RETRY_BACKOFF_SECONDS = 0.5
-DEFAULT_BATCH_TABLE = r"D:\imgclaw\pythonProject\data\tk-61-1.csv"
-DEFAULT_BATCH_OUTPUT_DIR = r"D:\imgclaw\pythonProject\data\probe_json"
+DEFAULT_BATCH_TABLE = r"D:\imgclaw\pythonProject\data\精品\精品-64-all.csv"
+DEFAULT_BATCH_OUTPUT_DIR = r"D:\imgclaw\pythonProject\data\精品\精品202689"
 COMPLETED_MARK = "已完成"
+TITLE_TARGET_CLASSES = {"col-md-7", "pull-left", "video-name"}
+HTML_VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+}
+
+
+class ArticleTitleParser(HTMLParser):
+    """提取目标 div 内第一个 h3 的文本。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._target_depth: Optional[int] = None
+        self._h3_depth: Optional[int] = None
+        self._h3_parts: list[str] = []
+        self._stack: list[str] = []
+        self.title: Optional[str] = None
+
+    @staticmethod
+    def _classes(attrs: list[tuple[str, Optional[str]]]) -> set[str]:
+        value = dict(attrs).get("class") or ""
+        return set(value.split())
+
+    def handle_starttag(
+            self,
+            tag: str,
+            attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        if self.title is not None:
+            return
+
+        tag_name = tag.lower()
+        current_depth = len(self._stack)
+        if self._target_depth is None and tag_name == "div":
+            if TITLE_TARGET_CLASSES.issubset(self._classes(attrs)):
+                self._target_depth = current_depth
+
+        if self._target_depth is not None and self._h3_depth is None and tag_name == "h3":
+            if current_depth > self._target_depth:
+                self._h3_depth = current_depth
+
+        if tag_name not in HTML_VOID_TAGS:
+            self._stack.append(tag_name)
+
+    def handle_startendtag(
+            self,
+            tag: str,
+            attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        if tag.lower() == "br" and self._h3_depth is not None:
+            self._h3_parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.title is not None:
+            return
+
+        tag_name = tag.lower()
+        current_depth = len(self._stack) - 1
+        if self._h3_depth is not None and tag_name == "h3" and current_depth == self._h3_depth:
+            self._finish_title()
+
+        if (
+                self._target_depth is not None
+                and tag_name == "div"
+                and current_depth == self._target_depth
+        ):
+            if self._h3_depth is not None:
+                self._finish_title()
+            self._target_depth = None
+
+        if self._stack and self._stack[-1] == tag_name:
+            self._stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self._h3_depth is not None and self.title is None:
+            self._h3_parts.append(data)
+
+    def _finish_title(self) -> None:
+        value = " ".join("".join(self._h3_parts).split())
+        self.title = unescape(value) or None
+        self._h3_depth = None
+        self._h3_parts.clear()
 
 
 @dataclass(frozen=True)
@@ -304,6 +388,56 @@ def request_status(
         return None, {}, str(exc)
 
 
+def decode_html(content: bytes, header_charset: Optional[str] = None) -> str:
+    """按响应头、meta 声明和常见中文编码依次解码 HTML。"""
+    candidates: list[str] = []
+    if header_charset:
+        candidates.append(header_charset)
+
+    head = content[:8192].decode("ascii", errors="ignore")
+    meta_match = re.search(
+        r"<meta[^>]+charset\s*=\s*[\"']?\s*([A-Za-z0-9._:-]+)",
+        head,
+        flags=re.IGNORECASE,
+    )
+    if meta_match:
+        candidates.append(meta_match.group(1))
+
+    candidates.extend(["utf-8", "gb18030", "big5", "latin-1"])
+    seen: set[str] = set()
+    for charset in candidates:
+        normalized = charset.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return content.decode(charset)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+def extract_article_title(html_text: str) -> Optional[str]:
+    parser = ArticleTitleParser()
+    parser.feed(html_text)
+    parser.close()
+    return parser.title
+
+
+def fetch_article_title(article_url: str, timeout: float, user_agent: str) -> Optional[str]:
+    request = Request(
+        article_url,
+        headers={
+            "User-Agent": user_agent,
+            "Accept": "text/html,*/*;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        content = response.read()
+        html_text = decode_html(content, response.headers.get_content_charset())
+    return extract_article_title(html_text)
+
+
 def detect_url(
         url: str,
         minute: int,
@@ -411,6 +545,7 @@ def dump_hits(
         hits: list[Hit],
         summary: Optional[ProbeSummary] = None,
         article_url: Optional[str] = None,
+        article_title: Optional[str] = None,
         seed_url: Optional[str] = None,
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -419,6 +554,7 @@ def dump_hits(
         "summary": summary.message() if summary else "",
         "summary_data": asdict(summary) if summary else None,
         "article_url": article_url or "",
+        "article_title": article_title or "",
         "seed_url": seed_url or "",
         "results": [asdict(item) for item in hits],
     }
@@ -456,10 +592,19 @@ def store_detection_result(
         retry_failures: list[RetryFailure],
         output_path: str,
         retry_output_path: str,
+        article_url: str = "",
+        article_title: str = "",
+        seed_url: str = "",
 ) -> None:
     if result.hit:
         hits.append(result.hit)
-        dump_hits(output_path, hits)
+        dump_hits(
+            output_path,
+            hits,
+            article_url=article_url,
+            article_title=article_title,
+            seed_url=seed_url,
+        )
         return
 
     if result.retry_failure:
@@ -474,6 +619,9 @@ def run_final_retries(
         hits: list[Hit],
         output_path: str,
         retry_output_path: str,
+        article_url: str = "",
+        article_title: str = "",
+        seed_url: str = "",
 ) -> list[RetryFailure]:
     if not failures:
         return []
@@ -523,7 +671,13 @@ def run_final_retries(
 
                 if result.hit:
                     hits.append(result.hit)
-                    dump_hits(output_path, hits)
+                    dump_hits(
+                        output_path,
+                        hits,
+                        article_url=article_url,
+                        article_title=article_title,
+                        seed_url=seed_url,
+                    )
 
                 if result.retry_failure:
                     final_failures.append(result.retry_failure)
@@ -536,7 +690,13 @@ def run_final_retries(
                         f"still_failed={len(final_failures)}"
                     )
 
-    dump_hits(output_path, hits)
+    dump_hits(
+        output_path,
+        hits,
+        article_url=article_url,
+        article_title=article_title,
+        seed_url=seed_url,
+    )
     dump_retry_failures(retry_output_path, final_failures)
     printer.line(
         f"[最终重试完成] checked={checked}/{len(failures)}, "
@@ -829,6 +989,23 @@ def run_probe(
     max_minute = seed.minute + minute_increment_count
     total = count_candidates(seed, minute_increment_count, stop_position)
     retry_output_path = args.retry_output or default_retry_output_path(args.output)
+    article_title = ""
+
+    if article_url:
+        printer.line(f"[标题] 正在获取: {article_url}")
+        try:
+            article_title = fetch_article_title(
+                article_url,
+                timeout=args.timeout,
+                user_agent=args.user_agent,
+            ) or ""
+        except Exception as exc:
+            printer.line(f"[标题警告] 获取失败，继续探测图片: {exc}")
+        else:
+            if article_title:
+                printer.line(f"[标题] {article_title}")
+            else:
+                printer.line("[标题警告] 页面中未找到目标 h3，继续探测图片")
 
     # 计算候选位置区间：基础区间 [start_pos, base_end)，
     # 延伸上界 abs_end（受下一行文件名 stop_position 约束，否则封顶到本小时末尾）。
@@ -942,6 +1119,9 @@ def run_probe(
                     retry_failures,
                     args.output,
                     retry_output_path,
+                    article_url,
+                    article_title,
+                    args.url,
                 )
 
         seed_url = build_url(seed, seed.minute, seed.second, seed.fraction)
@@ -965,6 +1145,9 @@ def run_probe(
                     retry_failures,
                     args.output,
                     retry_output_path,
+                    article_url,
+                    article_title,
+                    args.url,
                 )
 
         if reached_img_limit():
@@ -1017,6 +1200,9 @@ def run_probe(
                                 retry_failures,
                                 args.output,
                                 retry_output_path,
+                                article_url,
+                                article_title,
+                                args.url,
                             )
 
                         if checked % 1000 == 0:
@@ -1037,7 +1223,13 @@ def run_probe(
         interrupted = True
         printer.line("[中断] 收到 Ctrl+C，正在保存已发现结果...")
     finally:
-        dump_hits(args.output, hits, article_url=article_url, seed_url=args.url)
+        dump_hits(
+            args.output,
+            hits,
+            article_url=article_url,
+            article_title=article_title,
+            seed_url=args.url,
+        )
         dump_retry_failures(retry_output_path, retry_failures)
 
     if not interrupted and retry_failures:
@@ -1049,6 +1241,9 @@ def run_probe(
             hits,
             args.output,
             retry_output_path,
+            article_url,
+            article_title,
+            args.url,
         )
 
     elapsed = max(time.monotonic() - started_at, 0.001)
@@ -1060,7 +1255,14 @@ def run_probe(
         elapsed_seconds=elapsed,
         interrupted=interrupted,
     )
-    dump_hits(args.output, hits, summary=summary, article_url=article_url, seed_url=args.url)
+    dump_hits(
+        args.output,
+        hits,
+        summary=summary,
+        article_url=article_url,
+        article_title=article_title,
+        seed_url=args.url,
+    )
     dump_retry_failures(retry_output_path, retry_failures)
     printer.line(summary.message())
     return summary
@@ -1159,6 +1361,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("url", nargs="?", help="单条模式的样例图片 URL")
     parser.add_argument(
+        "--article-url",
+        default="",
+        help="单条模式对应的文章 URL；提供后会提取标题并写入 JSON",
+    )
+    parser.add_argument(
         "--batch-table",
         default=None,
         help=f"批量 CSV 表格路径，默认自动识别当前目录的 {DEFAULT_BATCH_TABLE}",
@@ -1242,7 +1449,7 @@ def main() -> int:
         args.url = input("请输入样例图片 URL：\n").strip()
 
     try:
-        run_probe(args, SafePrinter())
+        run_probe(args, SafePrinter(), article_url=args.article_url.strip())
     except (ValueError, argparse.ArgumentTypeError) as exc:
         print(f"[配置错误] {exc}", file=sys.stderr)
         return 2
