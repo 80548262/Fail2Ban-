@@ -120,11 +120,15 @@ log "启用并重启 Fail2Ban..."
 systemctl enable fail2ban
 systemctl restart fail2ban
 
+FAIL2BAN_STATUS=""
+SSHD_JAIL_STATUS=""
+
 wait_for_fail2ban() {
   local attempt
 
   for attempt in {1..15}; do
-    if fail2ban-client ping >/dev/null 2>&1; then
+    if FAIL2BAN_STATUS="$(fail2ban-client status 2>/dev/null)" &&
+      SSHD_JAIL_STATUS="$(fail2ban-client status sshd 2>/dev/null)"; then
       return 0
     fi
 
@@ -146,8 +150,8 @@ if ! wait_for_fail2ban; then
 fi
 
 log "Fail2Ban 状态："
-fail2ban-client status
-fail2ban-client status sshd
+printf '%s\n' "$FAIL2BAN_STATUS"
+printf '%s\n' "$SSHD_JAIL_STATUS"
 
 log "UFW 状态："
 ufw status verbose
