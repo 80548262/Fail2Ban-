@@ -120,9 +120,28 @@ log "启用并重启 Fail2Ban..."
 systemctl enable fail2ban
 systemctl restart fail2ban
 
-if ! systemctl is-active --quiet fail2ban; then
-  warn "Fail2Ban 启动失败"
+wait_for_fail2ban() {
+  local attempt
+
+  for attempt in {1..15}; do
+    if fail2ban-client ping >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if systemctl is-failed --quiet fail2ban; then
+      return 1
+    fi
+
+    sleep 1
+  done
+
+  return 1
+}
+
+if ! wait_for_fail2ban; then
+  warn "Fail2Ban 未能在 15 秒内就绪"
   systemctl --no-pager --full status fail2ban || true
+  journalctl --no-pager -u fail2ban -n 50 || true
   exit 1
 fi
 
